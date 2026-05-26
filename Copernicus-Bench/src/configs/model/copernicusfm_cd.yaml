@@ -9,3 +9,18 @@ embed_dim: 768
 pretrained_path: "CopernicusFM_ViT_base_varlang_e100.pth"
 out_features: true
 full_finetune: false
+
+# Optional task evidence validity hooks. Disabled by default.
+use_evidence_memory: false
+memory_path: null
+memory_feature: change_diff
+memory_size: 1024
+normalize_evidence_features: true
+
+ot_epsilon: 0.05
+ot_iters: 30
+validity_alpha: 1.0
+validity_beta: 0.1
+validity_temperature: 1.0
+
+calibration_mode: none  # none / score_only / feature_scale

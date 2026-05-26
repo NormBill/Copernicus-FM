@@ -10,6 +10,9 @@ from mmseg.models.necks import Feature2Pyramid
 from mmseg.models.decode_heads import UPerHead, FCNHead
 from util.misc import resize
 from .lightning_task import LightningTask
+from .modules.evidence_memory import TaskEvidenceMemory
+from .modules.ot_matcher import OTMatcher
+from .modules.validity_calibrator import ValidityCalibrator
 from timm.models.layers import trunc_normal_
 from util.misc import seg_metric, cls_metric, reg_metric
 #from huggingface_hub import hf_hub_download
@@ -17,6 +20,85 @@ from torchvision.datasets.utils import download_url
 import os
 
 import pdb
+
+
+def _init_optional_evidence(owner, model_config):
+    owner.use_evidence_memory = bool(getattr(model_config, "use_evidence_memory", False))
+    if owner.use_evidence_memory:
+        memory_path = getattr(model_config, "memory_path", None)
+        if memory_path is None:
+            raise ValueError(
+                "use_evidence_memory is true, but model_config.memory_path is not set."
+            )
+        owner.evidence_memory = TaskEvidenceMemory(memory_path)
+        owner.ot_matcher = OTMatcher(
+            ot_epsilon=getattr(model_config, "ot_epsilon", 0.05),
+            ot_iters=getattr(model_config, "ot_iters", 30),
+            validity_alpha=getattr(model_config, "validity_alpha", 1.0),
+            validity_beta=getattr(model_config, "validity_beta", 0.1),
+            validity_temperature=getattr(model_config, "validity_temperature", 1.0),
+            normalize_features=getattr(model_config, "normalize_evidence_features", True),
+        )
+        owner.validity_calibrator = ValidityCalibrator(
+            getattr(model_config, "calibration_mode", "none")
+        )
+    else:
+        owner.evidence_memory = None
+        owner.ot_matcher = None
+        owner.validity_calibrator = None
+
+
+def _pool_final_feature_map(feats):
+    final_feat = feats[-1]
+    if final_feat.ndim != 4:
+        raise ValueError(
+            "Expected final feature map with shape [B, C, H, W], "
+            f"got {tuple(final_feat.shape)}."
+        )
+    return final_feat.mean(dim=(-2, -1))
+
+
+def _match_task_evidence(owner, evidence_feature):
+    if not getattr(owner, "use_evidence_memory", False):
+        return None
+    return owner.ot_matcher(evidence_feature, owner.evidence_memory.get_features())
+
+
+def _log_task_evidence_metrics(owner, outputs, prefix):
+    if not getattr(owner, "use_evidence_memory", False) or len(outputs) <= 2:
+        return
+    evidence = outputs[-1]
+    if not isinstance(evidence, dict):
+        return
+    validity = evidence["validity"]
+    owner.log(
+        f"{prefix}_mean_ot_cost",
+        evidence["ot_cost"].mean(),
+        on_step=False,
+        on_epoch=True,
+        prog_bar=False,
+    )
+    owner.log(
+        f"{prefix}_mean_transport_entropy",
+        evidence["transport_entropy"].mean(),
+        on_step=False,
+        on_epoch=True,
+        prog_bar=False,
+    )
+    owner.log(
+        f"{prefix}_mean_validity",
+        validity.mean(),
+        on_step=False,
+        on_epoch=True,
+        prog_bar=False,
+    )
+    owner.log(
+        f"{prefix}_low_validity_fraction",
+        (validity < 0.5).float().mean(),
+        on_step=False,
+        on_epoch=True,
+        prog_bar=False,
+    )
 
 
 class CopernicusFMClassification(LightningTask):
@@ -81,13 +163,26 @@ class CopernicusFMClassification(LightningTask):
             if data_config.multilabel
             else nn.CrossEntropyLoss()
         )
+        _init_optional_evidence(self, model_config)
 
     def loss(self, outputs, labels):
         return self.criterion(outputs[0], labels)
 
     def forward(self, samples, metas):
         out_logits, feats = self.encoder(samples, metas, self.data_config.key, self.data_config.band_wavelengths, self.data_config.band_bandwidths, self.language_embed, self.data_config.input_mode, self.data_config.kernel_size)
-        return (out_logits, feats) #if self.model_config.out_features else out_logits
+        if not self.use_evidence_memory:
+            return (out_logits, feats) #if self.model_config.out_features else out_logits
+
+        evidence = self.ot_matcher(feats, self.evidence_memory.get_features())
+        validity = evidence["validity"]
+        calibration_mode = getattr(self.model_config, "calibration_mode", "none")
+        if calibration_mode == "feature_scale":
+            feats = self.validity_calibrator(feats, validity)
+            out_logits = self.encoder.forward_head(feats)
+        elif calibration_mode == "logit_scale":
+            out_logits = self.validity_calibrator(out_logits, validity)
+
+        return (out_logits, feats, evidence)
 
     def params_to_optimize(self):
         return self.encoder.head.parameters()
@@ -104,6 +199,7 @@ class CopernicusFMClassification(LightningTask):
         )
         self.log(f"{prefix}_acc1", acc1, on_step=True, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_acc5", acc5, on_step=True, on_epoch=True, prog_bar=True)
+        _log_task_evidence_metrics(self, outputs, prefix)
 
 
 class CopernicusFMSegmentation(LightningTask):
@@ -185,6 +281,7 @@ class CopernicusFMSegmentation(LightningTask):
             ),
         )
         self.criterion = nn.CrossEntropyLoss(ignore_index=data_config.ignore_index)
+        _init_optional_evidence(self, model_config)
 
     def loss(self, outputs, labels):
         return self.criterion(outputs[0], labels) + 0.4 * self.criterion(
@@ -193,6 +290,11 @@ class CopernicusFMSegmentation(LightningTask):
 
     def forward(self, samples, metas):
         feats = self.encoder(samples, metas, self.data_config.key, self.data_config.band_wavelengths, self.data_config.band_bandwidths, self.language_embed, self.data_config.input_mode, self.data_config.kernel_size)
+        evidence = None
+        if self.use_evidence_memory:
+            evidence = _match_task_evidence(self, _pool_final_feature_map(feats))
+        if evidence is not None and getattr(self.model_config, "calibration_mode", "none") == "feature_scale":
+            feats = self.validity_calibrator(feats, evidence["validity"])
         feats = self.neck(feats)
         out = self.decoder(feats)
         out = resize(out, size=samples.shape[2:], mode="bilinear", align_corners=False)
@@ -200,6 +302,8 @@ class CopernicusFMSegmentation(LightningTask):
         out_a = resize(
             out_a, size=samples.shape[2:], mode="bilinear", align_corners=False
         )
+        if evidence is not None:
+            return out, out_a, evidence
         return out, out_a
 
     def params_to_optimize(self):
@@ -216,6 +320,7 @@ class CopernicusFMSegmentation(LightningTask):
         self.log(f"{prefix}_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_miou", miou, on_step=True, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
+        _log_task_evidence_metrics(self, outputs, prefix)
 
 
 class CopernicusFMRegression(LightningTask):
@@ -300,6 +405,7 @@ class CopernicusFMRegression(LightningTask):
             self.criterion = torch.nn.L1Loss(reduction='none')
         else:
             self.criterion = torch.nn.L1Loss()
+        _init_optional_evidence(self, model_config)
 
     def loss(self, outputs, labels):
 
@@ -321,6 +427,11 @@ class CopernicusFMRegression(LightningTask):
 
     def forward(self, samples, metas):
         feats = self.encoder(samples, metas, self.data_config.key, self.data_config.band_wavelengths, self.data_config.band_bandwidths, self.language_embed, self.data_config.input_mode, self.data_config.kernel_size)
+        evidence = None
+        if self.use_evidence_memory:
+            evidence = _match_task_evidence(self, _pool_final_feature_map(feats))
+        if evidence is not None and getattr(self.model_config, "calibration_mode", "none") == "feature_scale":
+            feats = self.validity_calibrator(feats, evidence["validity"])
         feats = self.neck(feats)
         out = self.decoder(feats)
         out = resize(out, size=samples.shape[2:], mode="bilinear", align_corners=False)
@@ -328,6 +439,8 @@ class CopernicusFMRegression(LightningTask):
         out_a = resize(
             out_a, size=samples.shape[2:], mode="bilinear", align_corners=False
         )
+        if evidence is not None:
+            return out, out_a, evidence
         return out, out_a
         # return out, out
 
@@ -349,6 +462,7 @@ class CopernicusFMRegression(LightningTask):
         loss = self.loss(outputs, targets)
         self.log(f"{prefix}_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_rmse", rmse, on_step=True, on_epoch=True, prog_bar=True)
+        _log_task_evidence_metrics(self, outputs, prefix)
         #self.log(f"{prefix}_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
 
 
@@ -432,6 +546,7 @@ class CopernicusFMChange(LightningTask):
             ),
         )
         self.criterion = nn.CrossEntropyLoss(ignore_index=data_config.ignore_index)
+        _init_optional_evidence(self, model_config)
 
     def loss(self, outputs, labels):
         return self.criterion(outputs[0], labels) + 0.4 * self.criterion(
@@ -450,6 +565,12 @@ class CopernicusFMChange(LightningTask):
         feats = []
         for i in range(len(feats_pre)):
             feats.append(feats_post[i] - feats_pre[i])
+
+        evidence = None
+        if self.use_evidence_memory:
+            evidence = _match_task_evidence(self, _pool_final_feature_map(feats))
+        if evidence is not None and getattr(self.model_config, "calibration_mode", "none") == "feature_scale":
+            feats = self.validity_calibrator(feats, evidence["validity"])
         
         feats = self.neck(feats)
         out = self.decoder(feats)
@@ -458,6 +579,8 @@ class CopernicusFMChange(LightningTask):
         out_a = resize(
             out_a, size=samples.shape[2:], mode="bilinear", align_corners=False
         )
+        if evidence is not None:
+            return out, out_a, evidence
         return out, out_a
 
     def params_to_optimize(self):
@@ -474,6 +597,7 @@ class CopernicusFMChange(LightningTask):
         self.log(f"{prefix}_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_miou", miou, on_step=True, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
+        _log_task_evidence_metrics(self, outputs, prefix)
 
 
 

@@ -1,0 +1,6 @@
+defaults:
+  - copernicusfm_cls
+
+use_evidence_memory: true
+memory_path: ${oc.env:TASK_EVIDENCE_MEMORY}
+calibration_mode: logit_scale

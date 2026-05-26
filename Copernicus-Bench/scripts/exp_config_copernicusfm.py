@@ -132,6 +132,35 @@ experiments = [
 
 ]
 
+# Optional task evidence validity experiments.
+# Build a train-split-only memory first and set TASK_EVIDENCE_MEMORY to its .pt path.
+evidence_experiments = [
+    {
+        "model": "copernicusfm_cls_evidence_score_only",
+        "dataset": "cobench_eurosat_s2",
+        "task": "classification",
+        "batch_size": 64,
+        "lr": 0.1,
+        "epochs": 50,
+    },
+    {
+        "model": "copernicusfm_cls_evidence_logit_scale",
+        "dataset": "cobench_eurosat_s2",
+        "task": "classification",
+        "batch_size": 64,
+        "lr": 0.1,
+        "epochs": 50,
+    },
+    {
+        "model": "copernicusfm_cls_evidence_feature_scale",
+        "dataset": "cobench_eurosat_s2",
+        "task": "classification",
+        "batch_size": 64,
+        "lr": 0.1,
+        "epochs": 50,
+    },
+]
+
 # Run each experiment
 for exp in experiments:
     print(f"Running experiment: {exp['model']} on {exp['dataset']}")
