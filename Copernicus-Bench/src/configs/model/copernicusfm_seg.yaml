@@ -10,7 +10,28 @@ pretrained_path: "CopernicusFM_ViT_base_varlang_e100.pth"
 out_features: true
 full_finetune: false
 
-# Optional task evidence validity hooks. Disabled by default.
+# Universal-to-task transfer interface hooks. Classification is implemented first;
+# segmentation patch evidence atoms can be added here later.
+use_transfer_interface: false
+task_evidence_memory_path: null
+task_evidence_feature_type: "feature_map"
+
+evidence_router_mode: "class_conditional"
+evidence_topk: 64
+evidence_use_ot: true
+assignment_entropy_weight: 0.01
+
+transfer_calibrator_mode: "gated_residual"
+transfer_calibrator_hidden_dim: null
+transfer_calibrator_dropout: 0.0
+
+train_transfer_interface: true
+
+use_global_ot_ablation: false
+use_nearest_prototype_ablation: false
+use_adapter_only_ablation: false
+
+# Legacy global OT validity hooks. Keep disabled unless running the ablation.
 use_evidence_memory: false
 memory_path: null
 memory_feature: feature_map_pool

@@ -10,9 +10,12 @@ from mmseg.models.necks import Feature2Pyramid
 from mmseg.models.decode_heads import UPerHead, FCNHead
 from util.misc import resize
 from .lightning_task import LightningTask
-from .modules.evidence_memory import TaskEvidenceMemory
+from .modules.evidence_memory import TaskEvidenceMemory as GlobalEvidenceMemory
 from .modules.ot_matcher import OTMatcher
 from .modules.validity_calibrator import ValidityCalibrator
+from .modules.task_evidence_memory import TaskEvidenceMemory
+from .modules.ot_evidence_router import OTEvidenceRouter
+from .modules.transfer_calibrator import TransferCalibrator
 from timm.models.layers import trunc_normal_
 from util.misc import seg_metric, cls_metric, reg_metric
 #from huggingface_hub import hf_hub_download
@@ -23,14 +26,20 @@ import pdb
 
 
 def _init_optional_evidence(owner, model_config):
-    owner.use_evidence_memory = bool(getattr(model_config, "use_evidence_memory", False))
+    owner.use_evidence_memory = bool(
+        getattr(model_config, "use_evidence_memory", False)
+        or getattr(model_config, "use_global_ot_ablation", False)
+    )
     if owner.use_evidence_memory:
         memory_path = getattr(model_config, "memory_path", None)
         if memory_path is None:
+            memory_path = getattr(model_config, "task_evidence_memory_path", None)
+        if memory_path is None:
             raise ValueError(
-                "use_evidence_memory is true, but model_config.memory_path is not set."
+                "Global OT ablation is enabled, but no memory_path or "
+                "task_evidence_memory_path is set."
             )
-        owner.evidence_memory = TaskEvidenceMemory(memory_path)
+        owner.evidence_memory = GlobalEvidenceMemory(memory_path)
         owner.ot_matcher = OTMatcher(
             ot_epsilon=getattr(model_config, "ot_epsilon", 0.05),
             ot_iters=getattr(model_config, "ot_iters", 30),
@@ -47,6 +56,65 @@ def _init_optional_evidence(owner, model_config):
         owner.evidence_memory = None
         owner.ot_matcher = None
         owner.validity_calibrator = None
+
+
+def _init_transfer_interface(owner, model_config, feature_dim):
+    owner.use_transfer_interface = bool(
+        getattr(model_config, "use_transfer_interface", False)
+    )
+    owner.use_adapter_only_ablation = bool(
+        getattr(model_config, "use_adapter_only_ablation", False)
+    )
+    if not owner.use_transfer_interface:
+        owner.task_evidence_memory = None
+        owner.evidence_router = None
+        owner.transfer_calibrator = None
+        return
+
+    # EO foundation models learn universal embeddings, but downstream tasks still
+    # use them through task-specific predictors trained with direct task losses.
+    # This leaves the application of universal representations largely implicit.
+    # We introduce a universal-to-task transfer interface that assigns encoder
+    # features to task evidence structures before prediction.
+    if owner.use_adapter_only_ablation:
+        owner.task_evidence_memory = None
+        owner.evidence_router = None
+    else:
+        memory_path = getattr(model_config, "task_evidence_memory_path", None)
+        if memory_path is None:
+            memory_path = getattr(model_config, "memory_path", None)
+        if memory_path is None:
+            raise ValueError(
+                "use_transfer_interface is true, but "
+                "task_evidence_memory_path is not set."
+            )
+        owner.task_evidence_memory = TaskEvidenceMemory(
+            memory_path,
+            normalize=getattr(model_config, "normalize_evidence_features", True),
+        )
+
+        router_mode = getattr(model_config, "evidence_router_mode", "class_conditional")
+        if getattr(model_config, "use_global_ot_ablation", False):
+            router_mode = "global_ot_ablation"
+        elif getattr(model_config, "use_nearest_prototype_ablation", False):
+            router_mode = "nearest_prototype_ablation"
+
+        owner.evidence_router = OTEvidenceRouter(
+            mode=router_mode,
+            topk=getattr(model_config, "evidence_topk", 64),
+            ot_epsilon=getattr(model_config, "ot_epsilon", 0.05),
+            ot_iters=getattr(model_config, "ot_iters", 30),
+            normalize_features=getattr(model_config, "normalize_evidence_features", True),
+            entropy_weight=getattr(model_config, "assignment_entropy_weight", 0.01),
+            use_ot=getattr(model_config, "evidence_use_ot", True),
+        )
+
+    owner.transfer_calibrator = TransferCalibrator(
+        feature_dim=feature_dim,
+        mode=getattr(model_config, "transfer_calibrator_mode", "gated_residual"),
+        hidden_dim=getattr(model_config, "transfer_calibrator_hidden_dim", None),
+        dropout=getattr(model_config, "transfer_calibrator_dropout", 0.0),
+    )
 
 
 def _pool_final_feature_map(feats):
@@ -102,6 +170,42 @@ def _log_task_evidence_metrics(owner, outputs, prefix):
     )
 
 
+def _log_transfer_interface_metrics(owner, outputs, prefix):
+    if not getattr(owner, "use_transfer_interface", False) or len(outputs) <= 2:
+        return
+    stats = outputs[-1]
+    if not isinstance(stats, dict) or "routed_evidence" not in stats:
+        return
+
+    metric_map = {
+        "mean_d_pos": "d_pos",
+        "mean_d_neg": "d_neg",
+        "mean_evidence_margin": "evidence_margin",
+        "mean_assignment_entropy": "assignment_entropy",
+        "mean_gate_value": "mean_gate_value",
+    }
+    for metric_name, stat_name in metric_map.items():
+        if stat_name in stats and torch.is_tensor(stats[stat_name]):
+            owner.log(
+                f"{prefix}_{metric_name}",
+                stats[stat_name].float().mean(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+            )
+
+    predicted_labels = stats.get("predicted_labels")
+    if torch.is_tensor(predicted_labels):
+        for cls in predicted_labels.detach().unique(sorted=True):
+            owner.log(
+                f"{prefix}_task_evidence_usage_class_{int(cls.item())}",
+                (predicted_labels == cls).float().mean(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+            )
+
+
 class CopernicusFMClassification(LightningTask):
 
     url = "https://huggingface.co/wangyi111/Copernicus-FM/resolve/main/{}"
@@ -152,9 +256,10 @@ class CopernicusFMClassification(LightningTask):
         if model_config.freeze_backbone:
             self.freeze(self.encoder)
 
+        feature_dim = self.encoder.head.in_features
         trunc_normal_(self.encoder.head.weight, std=0.01)
         self.encoder.head = nn.Sequential(
-            nn.BatchNorm1d(self.encoder.head.in_features, affine=False, eps=1e-6),
+            nn.BatchNorm1d(feature_dim, affine=False, eps=1e-6),
             self.encoder.head,
         )
         self.unfreeze(self.encoder.head)
@@ -164,13 +269,45 @@ class CopernicusFMClassification(LightningTask):
             if data_config.multilabel
             else nn.CrossEntropyLoss()
         )
-        _init_optional_evidence(self, model_config)
+        _init_transfer_interface(self, model_config, feature_dim)
+        if self.use_transfer_interface:
+            self.use_evidence_memory = False
+            self.evidence_memory = None
+            self.ot_matcher = None
+            self.validity_calibrator = None
+        else:
+            _init_optional_evidence(self, model_config)
 
     def loss(self, outputs, labels):
         return self.criterion(outputs[0], labels)
 
     def forward(self, samples, metas):
         out_logits, feats = self.encoder(samples, metas, self.data_config.key, self.data_config.band_wavelengths, self.data_config.band_bandwidths, self.language_embed, self.data_config.input_mode, self.data_config.kernel_size)
+        if self.use_transfer_interface:
+            if self.use_adapter_only_ablation:
+                router_stats = {
+                    "routed_evidence": feats,
+                    "d_pos": feats.new_zeros(feats.shape[0]),
+                    "d_neg": feats.new_zeros(feats.shape[0]),
+                    "evidence_margin": feats.new_zeros(feats.shape[0]),
+                    "assignment_entropy": feats.new_zeros(feats.shape[0]),
+                }
+                routed_evidence = feats
+            else:
+                router_stats = self.evidence_router(
+                    query_features=feats,
+                    memory_features=self.task_evidence_memory.get_features(),
+                    memory_labels=self.task_evidence_memory.get_labels(),
+                    logits=out_logits,
+                )
+                routed_evidence = router_stats["routed_evidence"]
+
+            calibrated_feats = self.transfer_calibrator(
+                feats, routed_evidence, router_stats
+            )
+            out_logits = self.encoder.forward_head(calibrated_feats)
+            return (out_logits, calibrated_feats, router_stats)
+
         if not self.use_evidence_memory:
             return (out_logits, feats) #if self.model_config.out_features else out_logits
 
@@ -186,7 +323,14 @@ class CopernicusFMClassification(LightningTask):
         return (out_logits, feats, evidence)
 
     def params_to_optimize(self):
-        return self.encoder.head.parameters()
+        params = list(self.encoder.head.parameters())
+        if (
+            getattr(self, "use_transfer_interface", False)
+            and getattr(self.model_config, "train_transfer_interface", True)
+            and self.transfer_calibrator is not None
+        ):
+            params += list(self.transfer_calibrator.parameters())
+        return params
 
     def log_metrics(self, outputs, targets, prefix="train"):
         # Calculate accuracy and other classification-specific metrics
@@ -200,6 +344,7 @@ class CopernicusFMClassification(LightningTask):
         )
         self.log(f"{prefix}_acc1", acc1, on_step=True, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_acc5", acc5, on_step=True, on_epoch=True, prog_bar=True)
+        _log_transfer_interface_metrics(self, outputs, prefix)
         _log_task_evidence_metrics(self, outputs, prefix)
 
 

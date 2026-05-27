@@ -132,8 +132,24 @@ experiments = [
 
 ]
 
-# Optional task evidence validity experiments.
-# Build a train-split-only memory first and set TASK_EVIDENCE_MEMORY to its .pt path.
+# Optional universal-to-task transfer experiments.
+# Build a train-split-only task evidence memory first and set TASK_EVIDENCE_MEMORY to its .pt path.
+transfer_experiments = [
+    {
+        "model": "copernicusfm_cls",
+        "dataset": "cobench_eurosat_s2",
+        "task": "classification",
+        "batch_size": 64,
+        "lr": 0.1,
+        "epochs": 50,
+        "overrides": [
+            "model.use_transfer_interface=true",
+            "model.task_evidence_memory_path=${oc.env:TASK_EVIDENCE_MEMORY}",
+        ],
+    },
+]
+
+# Legacy global OT scalar ablations.
 evidence_experiments = [
     {
         "model": "copernicusfm_cls_evidence_score_only",
