@@ -21,6 +21,7 @@ ot_epsilon: 0.05
 ot_iters: 30
 validity_alpha: 1.0
 validity_beta: 0.1
+validity_bias: 1.0
 validity_temperature: 1.0
 
 calibration_mode: none  # none / score_only / feature_scale

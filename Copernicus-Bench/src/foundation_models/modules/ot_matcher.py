@@ -18,6 +18,7 @@ class OTMatcher(nn.Module):
         ot_iters: int = 30,
         validity_alpha: float = 1.0,
         validity_beta: float = 0.1,
+        validity_bias: float = 1.0,
         validity_temperature: float = 1.0,
         normalize_features: bool = True,
     ):
@@ -33,6 +34,7 @@ class OTMatcher(nn.Module):
         self.ot_iters = int(ot_iters)
         self.validity_alpha = float(validity_alpha)
         self.validity_beta = float(validity_beta)
+        self.validity_bias = float(validity_bias)
         self.validity_temperature = float(validity_temperature)
         self.normalize_features = bool(normalize_features)
 
@@ -89,7 +91,8 @@ class OTMatcher(nn.Module):
         ).clamp_min(0.0)
 
         logits = (
-            -self.validity_alpha * normalized_ot_cost
+            self.validity_bias
+            - self.validity_alpha * normalized_ot_cost
             - self.validity_beta * normalized_transport_entropy
         ) / self.validity_temperature
         validity = torch.sigmoid(logits)

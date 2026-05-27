@@ -36,6 +36,7 @@ def _init_optional_evidence(owner, model_config):
             ot_iters=getattr(model_config, "ot_iters", 30),
             validity_alpha=getattr(model_config, "validity_alpha", 1.0),
             validity_beta=getattr(model_config, "validity_beta", 0.1),
+            validity_bias=getattr(model_config, "validity_bias", 1.0),
             validity_temperature=getattr(model_config, "validity_temperature", 1.0),
             normalize_features=getattr(model_config, "normalize_evidence_features", True),
         )
